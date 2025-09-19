@@ -1,12 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Papa from 'papaparse';
-import fs from 'fs';
-import path from 'path';
 
 interface PersonData {
   firstname: string;
   lastname: string;
   barcode_range_count: number;
+  total_hours_worked: number;
+  barcodes_per_hour: number;
+  work_periods: Array<{
+    start_time: string;
+    end_time: string;
+    duration_hours: number;
+    barcode_count: number;
+  }>;
 }
 
 interface AnalysisResult {
@@ -22,6 +28,74 @@ interface AnalysisResult {
     upload_time: string;
   };
   error?: string;
+}
+
+function parseTimeToMinutes(timeStr: string): number {
+  // Parse time in format "HH:MM:SS.mmm" to minutes since midnight
+  const [timePart] = timeStr.split('.');
+  const [hours, minutes, seconds] = timePart.split(':').map(Number);
+  return hours * 60 + minutes + seconds / 60;
+}
+
+function calculateWorkPeriods(timeEntries: string[]): Array<{
+  start_time: string;
+  end_time: string;
+  duration_hours: number;
+  barcode_count: number;
+}> {
+  if (timeEntries.length === 0) return [];
+  
+  // Sort time entries
+  const sortedTimes = timeEntries.sort();
+  const periods: Array<{
+    start_time: string;
+    end_time: string;
+    duration_hours: number;
+    barcode_count: number;
+  }> = [];
+  
+  let currentPeriod = {
+    start_time: sortedTimes[0],
+    end_time: sortedTimes[0],
+    duration_hours: 0,
+    barcode_count: 1
+  };
+  
+  for (let i = 1; i < sortedTimes.length; i++) {
+    const prevTime = parseTimeToMinutes(sortedTimes[i - 1]);
+    const currentTime = parseTimeToMinutes(sortedTimes[i]);
+    const timeDiff = currentTime - prevTime;
+    
+    // If gap is more than 30 minutes, start a new period
+    if (timeDiff > 30) {
+      // Calculate duration for previous period
+      const startMinutes = parseTimeToMinutes(currentPeriod.start_time);
+      const endMinutes = parseTimeToMinutes(currentPeriod.end_time);
+      currentPeriod.duration_hours = (endMinutes - startMinutes) / 60;
+      
+      periods.push({ ...currentPeriod });
+      
+      // Start new period
+      currentPeriod = {
+        start_time: sortedTimes[i],
+        end_time: sortedTimes[i],
+        duration_hours: 0,
+        barcode_count: 1
+      };
+    } else {
+      // Continue current period
+      currentPeriod.end_time = sortedTimes[i];
+      currentPeriod.barcode_count++;
+    }
+  }
+  
+  // Add the last period
+  const startMinutes = parseTimeToMinutes(currentPeriod.start_time);
+  const endMinutes = parseTimeToMinutes(currentPeriod.end_time);
+  currentPeriod.duration_hours = (endMinutes - startMinutes) / 60;
+  periods.push(currentPeriod);
+  
+  return periods;
 }
 
 function detectEncoding(buffer: Buffer): BufferEncoding {
@@ -43,7 +117,7 @@ function detectEncoding(buffer: Buffer): BufferEncoding {
       if (text.includes(',') || text.includes('\t') || text.includes('firstname')) {
         return encoding;
       }
-    } catch (error) {
+    } catch {
       continue;
     }
   }
@@ -81,10 +155,10 @@ function analyzeBarcodes(csvContent: string): AnalysisResult {
       };
     }
 
-    const data = parseResult.data as any[];
+    const data = parseResult.data as Record<string, string>[];
 
     // Basic validation
-    const requiredColumns = ['firstname', 'lastname', 'BarcodeRangeID'];
+    const requiredColumns = ['firstname', 'lastname', 'BarcodeRangeID', 'TimeEntered'];
     const missingColumns = requiredColumns.filter(col => !data[0] || !(col in data[0]));
     
     if (missingColumns.length > 0) {
@@ -94,21 +168,42 @@ function analyzeBarcodes(csvContent: string): AnalysisResult {
       };
     }
 
-    // Group by person and count barcode ranges
-    const personCounts = new Map<string, number>();
+    // Group data by person and collect time entries
+    const personDataMap = new Map<string, {
+      firstname: string;
+      lastname: string;
+      timeEntries: string[];
+      barcodeCount: number;
+    }>();
     
     data.forEach((row) => {
       const key = `${row.firstname}_${row.lastname}`;
-      personCounts.set(key, (personCounts.get(key) || 0) + 1);
+      if (!personDataMap.has(key)) {
+        personDataMap.set(key, {
+          firstname: row.firstname,
+          lastname: row.lastname,
+          timeEntries: [],
+          barcodeCount: 0
+        });
+      }
+      
+      const personData = personDataMap.get(key)!;
+      personData.timeEntries.push(row.TimeEntered);
+      personData.barcodeCount++;
     });
 
-    // Convert to array format
-    const peopleData: PersonData[] = Array.from(personCounts.entries()).map(([key, count]) => {
-      const [firstname, lastname] = key.split('_');
+    const peopleData: PersonData[] = Array.from(personDataMap.values()).map(person => {
+      const workPeriods = calculateWorkPeriods(person.timeEntries);
+      const totalHoursWorked = workPeriods.reduce((sum, period) => sum + period.duration_hours, 0);
+      const barcodesPerHour = totalHoursWorked > 0 ? person.barcodeCount / totalHoursWorked : 0;
+      
       return {
-        firstname,
-        lastname,
-        barcode_range_count: count
+        firstname: person.firstname,
+        lastname: person.lastname,
+        barcode_range_count: person.barcodeCount,
+        total_hours_worked: Math.round(totalHoursWorked * 100) / 100,
+        barcodes_per_hour: Math.round(barcodesPerHour * 100) / 100,
+        work_periods: workPeriods
       };
     });
 
